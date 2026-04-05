@@ -263,6 +263,7 @@ SUBDIR_VTYPE = {
 def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
     tags = [tag.lower() for tag in re.findall(r'\[([^\]]+)\]', line)]
     vtype = next((tag for tag in tags if tag in VULN_TEMPLATES), default_vtype)
+    # Inherit severity from template — fixes nuclei defaulting everything to medium
     sev = VULN_TEMPLATES.get(vtype, VULN_TEMPLATES["misconfig"]).get("severity", "medium")
     if any(k in line for k in ("SQLI-POC-VERIFIED", "RCE-POC", "CRITICAL", "CONFIRMED")):
         sev = "critical"
