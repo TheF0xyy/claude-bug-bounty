@@ -114,12 +114,12 @@ Invoke the `recon-ranker` agent on cached recon. It produces:
 
 For each P1 target endpoint:
 
-1. Check hunt memory — "Have I tested this before?"
+1. **Dead-branch check** (see `## Dead-Branch Memory` below). If `(endpoint, vuln_class)` is dead, skip to next endpoint and do not issue any request.
 2. Select vuln class based on tech stack + URL pattern + memory
 3. Test with appropriate technique
 4. Log every request to audit.jsonl
 5. If signal found → check chain table (A→B)
-6. If 5 minutes with no progress → rotate to next endpoint
+6. If 5 minutes with no progress → **record dead branch with `reason=no_signal`**, then rotate to next endpoint
 
 ## Step 5: Validate
 
@@ -128,6 +128,54 @@ For each finding, run the 7-Question Gate:
 - Q2-Q7: Standard validation gates
 
 KILL weak findings immediately. Don't accumulate noise.
+**On any DROP verdict, record dead branch with `reason=rejected`.**
+
+## Dead-Branch Memory
+
+All targets share one state file at `./memory/hunt_state.json` (keyed by target
+hostname). The file is managed by `memory/state_manager.py` and accessed from
+Bash through the `tools/hunt_state.py` CLI so autopilot and the Python layer
+read and write the same file.
+
+Shape (top-level keys are target hostnames):
+```json
+{
+  "example.com": {
+    "dead_branches": [
+      {"endpoint": "...", "vuln_class": "idor", "reason": "no_signal", "ts": "..."}
+    ]
+  }
+}
+```
+
+Reasons (closed set): `no_signal`, `rejected`, `out_of_scope`.
+`vuln_class` may be `null` — means endpoint is dead for every class (used by scope fails).
+Dedup key is `(endpoint, vuln_class, reason)` within a target. No TTL.
+
+All ops go through the `tools/hunt_state.py` CLI (a thin wrapper over
+`memory/state_manager.py`). An empty `--vuln-class ""` stores as `null` →
+wildcard. `check` exits 0 when the branch is dead (Bash-true for `if`).
+
+### Check (before any test)
+```bash
+if python3 tools/hunt_state.py check \
+     --target "$TARGET" --endpoint "$ENDPOINT" --vuln-class "$VULN_CLASS"; then
+  echo "SKIP: dead branch ($ENDPOINT / $VULN_CLASS)"
+  # caller must skip this (endpoint, class) pair
+fi
+```
+
+### Record (rotation, DROP, or scope fail)
+```bash
+python3 tools/hunt_state.py record \
+  --target "$TARGET" --endpoint "$ENDPOINT" --vuln-class "$VULN_CLASS" \
+  --reason "$REASON"
+```
+
+Call-site reason mapping:
+- Step 1 scope fail → `REASON=out_of_scope`, `VULN_CLASS=""` (stored as null)
+- Step 4 rotation → `REASON=no_signal`
+- Step 5 Gate DROP → `REASON=rejected`
 
 ## Step 6: Report
 

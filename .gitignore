@@ -29,3 +29,6 @@ venv/
 # Tool output
 *.out
 nmap-output/
+
+# Dead-branch memory (per-machine)
+memory/hunt_state.json
