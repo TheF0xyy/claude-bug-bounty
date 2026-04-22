@@ -20,9 +20,12 @@ at least one (ideally two) accounts.
 
 ---
 
-## Step 1 — Fetch Proxy History for Target
+## Step 1 — Fetch ALL Proxy History (paginated, no regex)
 
-Paginate through **all** matching history entries before proceeding.
+Use `get_proxy_http_history` (**not** `get_proxy_http_history_regex`) to avoid
+caching issues caused by Claude Code reusing identical regex tool-call results.
+Paginate until all history has been fetched, then filter to the target host
+in memory.
 
 **Page loop:**
 
@@ -31,8 +34,7 @@ offset = 0
 all_entries = []
 
 loop:
-  Call get_proxy_http_history_regex with:
-    regex: "target\\.com"
+  Call get_proxy_http_history with:
     count: 100
     offset: <current offset>
 
@@ -48,81 +50,138 @@ loop:
     Continue loop.
 ```
 
-**After collecting all pages:**
+**Client-side host filter (applied after all pages collected):**
 
-- `total = len(all_entries)`
+Keep only entries where the `host` field (or the `Host:` header in the raw
+`request` text) matches the target domain.  A case-insensitive substring match
+is sufficient:
+
+```
+target_entries = [e for e in all_entries if TARGET in (e.host or "").lower()
+                                         or TARGET in raw_host_header(e).lower()]
+```
+
+**After filtering:**
+
+- `total = len(target_entries)`
 - If `total < 5`: tell the user:
 
-> Not enough Burp history for target.com — only N entries found.
-> Browse target.com while logged in through the Burp proxy, then
-> re-run `/burp-bootstrap target.com`.
+> Not enough Burp history for {target} — only {total} entries found.
+> Browse {target} while logged in through the Burp proxy, then
+> re-run `/burp-bootstrap {target}`.
 
 Stop here.
 
-All subsequent steps (Step 2 onward) operate on the complete `all_entries`
-collection, not just the first page.
+All subsequent steps (Step 2 onward) operate on `target_entries`.
 
 ---
 
-## Step 2 — Filter to Authenticated GET 200 Requests
+## Step 2 — Filter to Authenticated Requests
 
-From all returned history items, keep only entries where **all** of the
-following are true:
+From `target_entries`, keep only entries where **all** of the following are
+true:
 
 1. `method` is `GET`
 2. `statusCode` is `200`
-3. The raw `request` text contains at least one of:
+3. The raw `request` text contains at least one authenticated indicator:
    - `Authorization: Bearer` (case-insensitive)
-   - A cookie whose name matches any of: `session`, `sid`, `JSESSIONID`,
-     `MZPSID`, `CHKSESSIONID`, `token`, `auth`, `jwt` (case-insensitive
-     substring match on the cookie name)
+   - A cookie whose name contains any of (case-insensitive substring):
+     `session`, `sid`, `JSESSIONID`, `MZPSID`, `CHKSESSIONID`, `token`,
+     `auth`, `jwt`, `PHPSESSID`
 
 From the passing entries, keep the **top 30** sorted by URL length descending
 (longer URL = more specific path = higher IDOR value).
+
+Store this as `auth_entries` (used for candidate extraction in Step 6).
 
 ---
 
 ## Step 3 — Detect Distinct Accounts
 
-Parse the `Authorization` header from each filtered request in the full
-filtered set (drawn from all pages collected in Step 1).
+Cookie-based sites (e.g. those that set `MZPSID` on login) do not use distinct
+`Authorization` header values per account.  Use the following detection
+strategy, in priority order.
 
-**Group entries by their exact `Authorization` header value.**
+### 3a — Primary: MZPSID Set-Cookie detection (login-event based)
 
-| Distinct auth values found | Action |
+Scan **all** `target_entries` (not just `auth_entries`) for login events:
+
+```
+For each entry in target_entries:
+  Look in the response headers for:
+    Set-Cookie: MZPSID=<value>; ...
+  If found, record: { mzpsid_value: <value>, entry_index: i }
+```
+
+Collect all distinct `MZPSID` values seen in Set-Cookie response headers.
+
+**Mapping MZPSID → account session:**
+
+For each distinct MZPSID value discovered, find the **first subsequent request**
+in `target_entries` (by index, after the login entry) whose Cookie request
+header contains `MZPSID=<that value>`.  That request is the **representative
+request** for that account.
+
+| Distinct MZPSID values in Set-Cookie | Action |
 |---|---|
-| **2 or more** | `account_a` = first group (earliest entry); `account_b` = second group |
+| **2 or more** | `account_a` = first login's representative; `account_b` = second login's representative |
 | **Exactly 1** | `account_a` = that session; `account_b` = EMPTY |
-| **0** | Stop — see message below |
+| **0** | Fall through to 3b |
 
-**0 authenticated requests found:**
+### 3b — Fallback: Group by MZPSID cookie value in request headers
 
-> No authenticated requests found in Burp history for target.com.
-> Log in to target.com through the Burp proxy first, then re-run
-> `/burp-bootstrap target.com`.
+If no Set-Cookie MZPSID was found in responses (e.g. login happened in a
+previous Burp session), scan Cookie headers across `auth_entries`:
+
+```
+For each entry in auth_entries:
+  Parse the Cookie: header → extract MZPSID=<value>
+  Group entries by their MZPSID value
+```
+
+| Distinct MZPSID values in Cookie headers | Action |
+|---|---|
+| **2 or more** | `account_a` = group with earliest entry; `account_b` = group with second-earliest entry |
+| **Exactly 1** | `account_a` = that session; `account_b` = EMPTY |
+| **0** | Fall through to 3c |
+
+### 3c — Final fallback: Group by Authorization header
+
+```
+For each entry in auth_entries:
+  Extract the Authorization: header value
+  Group by exact value
+
+account_a = first group; account_b = second group (if present)
+```
+
+If no Authorization headers either:
+
+> No authenticated requests found in Burp history for {target}.
+> Log in to {target} through the Burp proxy first, then re-run
+> `/burp-bootstrap {target}`.
 
 Stop here.
 
-**Only 1 account found (warn and continue):**
+### One account only — warn and continue
+
+If only one account was detected regardless of method:
 
 > ⚠ Only one account found in Burp history.
-> Browse target.com with a **second account** in Burp before re-running
-> `/burp-bootstrap target.com` to enable A/B differential testing.
+> Browse {target} with a **second account** in Burp before re-running
+> `/burp-bootstrap {target}` to enable A/B differential testing.
 > Continuing with account_a only — account_b will be empty.
 
 ---
 
 ## Step 4 — Extract Session Material
 
-For each account found, use **one representative request** (the first/earliest
-entry for that Authorization value).
+For each detected account, select the **richest authenticated GET request**
+as the representative: from all entries belonging to that account, pick the
+one with the most non-tracking cookie name=value pairs.  Break ties by longest
+URL (more specific path).
 
-### Parse the raw request text
-
-**Extract Authorization header:**
-- Find the line starting with `Authorization:` (case-insensitive)
-- Store the full header value (e.g. `Bearer eyJ...`)
-- This becomes the `auth_header` field
+### Parse the representative request
 
 **Extract and classify cookies:**
 
@@ -130,6 +189,7 @@ Find the `Cookie:` header line. Split by `;` to get individual name=value
 pairs.
 
 Exclude these tracking cookies (name starts with or matches exactly):
+
 ```
 _ga, _gid, _gat, _fbp, _gcl, _hjid, _hjsession, _pk_,
 __utma, __utmb, __utmc, __utmz, __cf, __cf_bm,
@@ -138,33 +198,49 @@ cookielawinfo, viewed_cookie_policy, CookieConsent, euconsent,
 ajs_*, amplitude_*, mixpanel_*
 ```
 
-Include everything else, especially:
+Include everything else — especially session identifiers:
+
 ```
-session, sid, JSESSIONID, MZPSID, CHKSESSIONID,
-csrfToken, token, auth*, PHPSESSID, SSID, ASP.NET_SessionId
+MZPSID, CHKSESSIONID, session, sid, JSESSIONID,
+csrfToken, cid, token, auth*, PHPSESSID, SSID, ASP.NET_SessionId
 ```
+
+**Extract Authorization header (if present):**
+
+- Find the line starting with `Authorization:` (case-insensitive)
+- Store the full header value (e.g. `Bearer eyJ...`)
+- This becomes the `auth_header` field
+- If no Authorization header exists, use `""` for `auth_header`
 
 **Extract structural headers for replay fidelity:**
 
 Keep these headers if present (for the `headers` field in sessions.json):
+
 ```
 X-Domain, X-Site-Id, X-Requested-With, X-CSRF-Token, Origin
 ```
 
 Do NOT include these in sessions.json (they are per-request, not per-session):
+
 ```
 Accept, Referer, User-Agent, Content-Type, Host, Authorization, Cookie
 ```
+
+**Determine auth scheme for notes field:**
+
+- If `auth_header` is non-empty: note the scheme (e.g. `Bearer`)
+- If `auth_header` is empty and MZPSID cookie is present: note `cookie/MZPSID`
+- If neither: note `cookie/<primary_session_cookie_name>`
 
 **Build the sessions.json record:**
 
 ```json
 {
   "name": "account_a",
-  "cookies": { "<name>": "<value>", ... },
-  "headers": { "<name>": "<value>", ... },
-  "auth_header": "Bearer eyJ...",
-  "notes": "Bootstrapped from https://target.com/path (burp_history) | auth scheme: Bearer"
+  "cookies": { "MZPSID": "<value>", "CHKSESSIONID": "<value>", ... },
+  "headers": { "X-Domain": "<value>", ... },
+  "auth_header": "",
+  "notes": "Bootstrapped from https://target.com/path (burp_history) | auth scheme: cookie/MZPSID"
 }
 ```
 
@@ -194,17 +270,17 @@ Always append a `no_auth` entry at the end:
 [
   {
     "name": "account_a",
-    "cookies": { ... },
+    "cookies": { "MZPSID": "<VALUE-A>", ... },
     "headers": { ... },
-    "auth_header": "Bearer <TOKEN-A>",
-    "notes": "Bootstrapped from https://target.com/... | auth scheme: Bearer"
+    "auth_header": "",
+    "notes": "Bootstrapped from https://target.com/... | auth scheme: cookie/MZPSID"
   },
   {
     "name": "account_b",
-    "cookies": { ... },
+    "cookies": { "MZPSID": "<VALUE-B>", ... },
     "headers": { ... },
-    "auth_header": "Bearer <TOKEN-B>",
-    "notes": "Bootstrapped from https://target.com/... | auth scheme: Bearer"
+    "auth_header": "",
+    "notes": "Bootstrapped from https://target.com/... | auth scheme: cookie/MZPSID"
   },
   {
     "name": "no_auth",
@@ -248,7 +324,8 @@ re-validated later with a probe URL once one is known.
 
 ## Step 6 — Extract Candidate Endpoints
 
-From all 30 filtered requests, evaluate each URL for IDOR/BAC signal.
+From `auth_entries` (top 30 from Step 2), evaluate each URL for IDOR/BAC
+signal.
 
 ### Identifier detection rules
 
@@ -305,8 +382,8 @@ Print a structured summary table:
 
 Sessions saved → memory/sessions.json
 
-  account_a:  found  (auth scheme: Bearer | sub: user@example.com if JWT decodable)
-  account_b:  found  (auth scheme: Bearer | sub: other@example.com)
+  account_a:  found  (auth scheme: cookie/MZPSID | cid: 12345678 if present)
+  account_b:  found  (auth scheme: cookie/MZPSID | cid: 87654321)
   no_auth:    included (unauthenticated probe)
 
 Candidates added → hunt_state.json: N endpoints
@@ -326,25 +403,29 @@ Next steps:
   4. Full autopilot:       /autopilot target.com
 ```
 
-**JWT subject display:** If `auth_header` starts with `Bearer `, attempt to
-decode the JWT payload (middle segment, base64url-decode, parse as JSON). If
-successful, display `sub` or `email` claim. If decoding fails, display
-`"Bearer token (opaque)"`.  
-**Never display the raw token value.**
+**Account identity display:**
+
+- If a `cid` cookie is present: display its value as the account identifier.
+- If `auth_header` starts with `Bearer `, attempt to decode the JWT payload
+  (middle segment, base64url-decode, parse as JSON). Display `sub` or `email`
+  claim if found. If decoding fails display `"Bearer token (opaque)"`.
+- Otherwise display `"cookie session (opaque)"`.
+
+**Never display raw token values or raw cookie values.**
 
 ---
 
 ## Fallback: Burp Not Connected
 
-If `get_proxy_http_history_regex` returns an error or is not available, ask:
+If `get_proxy_http_history` returns an error or is not available, ask:
 
 > Burp MCP is not connected. How would you like to proceed?
 >
 > **Option 1 — Connect Burp MCP (recommended):**
 > 1. Open Burp Suite Professional
 > 2. Ensure the Burp MCP extension is running (port 9876)
-> 3. Browse target.com while logged in as two different accounts
-> 4. Re-run `/burp-bootstrap target.com`
+> 3. Browse {target} while logged in as two different accounts
+> 4. Re-run `/burp-bootstrap {target}`
 >
 > **Option 2 — Paste raw requests:**
 > Paste two complete HTTP requests (from Burp Repeater/Proxy) — one for each
@@ -376,9 +457,10 @@ manually for each one.
 
 | Situation | Response |
 |---|---|
-| Fewer than 5 history entries | Ask user to browse target in Burp first |
+| Fewer than 5 history entries for target | Ask user to browse target in Burp first |
 | 0 authenticated requests | Ask user to log in through Burp proxy first |
 | 1 account only | Warn, continue with account_a only |
+| No MZPSID in any entry | Fall through: try Authorization header grouping |
 | sessions.json already exists | Warn: "Overwriting existing sessions.json" and proceed |
 | hunt_state.json already has candidates | Deduplicated automatically by `add_candidate()` |
 | JWT decode fails | Show `"Bearer token (opaque)"` — never show raw token |
@@ -390,22 +472,38 @@ manually for each one.
 - Authorization header values are **never printed** to the terminal output.
 - Cookie values are **never printed** to the terminal output.
 - The `notes` field in sessions.json contains only the auth scheme name (e.g.
-  `Bearer`), not the token value.
+  `cookie/MZPSID`), not the token or cookie value.
+- The `cid` cookie value (customer ID) may be displayed since it is a
+  non-secret identifier, not a credential.
 - JWT claims (`sub`, `email`) may be shown for identification purposes since
   they are not secrets.
+
+---
+
+## Why `get_proxy_http_history` (not regex)
+
+The regex variant (`get_proxy_http_history_regex`) is prone to being returned
+as a cached tool-call result by Claude Code when the same regex is repeated
+across a session, meaning new Burp traffic captured since the first call would
+be silently omitted.
+
+By using the non-regex variant with explicit pagination and client-side host
+filtering, each call passes a different `offset` parameter, preventing cache
+hits and guaranteeing fresh data on every page.
 
 ---
 
 ## Manual Test
 
 1. Open Burp Suite Professional with the MCP extension enabled (port 9876)
-2. Browse `target.com` while logged in as **two different accounts** — make
-   several GET requests to `/api/…` paths so history is populated
-3. Run: `/burp-bootstrap target.com`
-4. Verify `memory/sessions.json` contains `account_a`, `account_b`, and
-   `no_auth` entries with non-empty `auth_header` or `cookies`
-5. Verify `memory/hunt_state.json` has `candidates` entries for the target
-6. Run: `python3.13 tools/auto_replay.py --target target.com --dry-run`
-7. Confirm the dry-run output lists the expected candidate endpoints with
-   `[SKIP]` or classification status
-8. Run: `python3.13 tools/auth_check.py` to verify sessions are valid
+2. Log in to `target.com` as **account_a** — browse several API paths
+3. Log in to `target.com` as **account_b** — browse several API paths  
+   (The second login sets a new `MZPSID` cookie via Set-Cookie, which is the
+   primary signal used to distinguish the two accounts)
+4. Run: `/burp-bootstrap target.com`
+5. Verify `memory/sessions.json` contains `account_a`, `account_b`, and
+   `no_auth` entries with non-empty `cookies` (MZPSID) or `auth_header`
+6. Verify `memory/hunt_state.json` has `candidates` entries for the target
+7. Run: `python3.13 tools/auto_replay.py --target target.com --dry-run`
+8. Confirm the dry-run output lists the expected candidate endpoints
+9. Run: `python3.13 tools/auth_check.py` to verify sessions are valid
