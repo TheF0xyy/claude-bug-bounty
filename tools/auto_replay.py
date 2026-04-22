@@ -107,14 +107,23 @@ from scope_checker import ScopeChecker                      # noqa: E402
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-#: Only these HTTP methods are permitted for auto-replay.
-#: POST/PUT/PATCH/DELETE and all others are hard-blocked to prevent any
-#: accidental state-changing side effects on the target application.
+#: Only these HTTP methods are permitted for auto-replay without opt-in.
+#: Write methods (PUT/PATCH/DELETE/POST) require allow_write=True on the
+#: AutoReplay instance (or --allow-write on the CLI).
 SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD"})
+
+#: Write methods that become allowed when allow_write=True.  Any method that
+#: is neither in SAFE_METHODS nor in WRITE_METHODS is hard-blocked regardless
+#: of allow_write (e.g. CONNECT, TRACE, exotic verbs).
+WRITE_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 #: Path substrings (case-insensitive) that indicate state-changing or
 #: particularly sensitive routes.  Any URL whose lowercased path contains
 #: one of these strings is skipped unconditionally before any request is made.
+#:
+#: Note: "address/update" was previously hard-blocked here but is now
+#: reachable via --allow-write for intentional write-method IDOR testing.
+#: All other entries remain unconditionally blocked regardless of allow_write.
 BLOCKED_PATH_SUBSTRINGS: frozenset[str] = frozenset({
     "payment",
     "checkout/confirm",
@@ -127,7 +136,6 @@ BLOCKED_PATH_SUBSTRINGS: frozenset[str] = frozenset({
     "refund",
     "transfer",
     "coupon/apply",
-    "address/update",
     "password",
     "reset-password",
     "email/update",
@@ -316,6 +324,7 @@ class AutoReplay:
         sessions_file: Path,
         audit_log: AuditLog,
         *,
+        allow_write: bool = False,
         scope_checker: Optional[ScopeChecker] = None,
         transport: Optional[TransportFn] = None,
         _rate_limiter: Optional[RateLimiter] = None,
@@ -327,6 +336,10 @@ class AutoReplay:
             state_file:    Path to ``hunt_state.json``.
             sessions_file: Path to ``sessions.json``.
             audit_log:     Pre-built ``AuditLog`` instance for request logging.
+            allow_write:   When ``True``, PUT/PATCH/DELETE/POST candidates are
+                           allowed through the method gate.  Default ``False``.
+                           Must only be set after explicit human approval — write
+                           methods can mutate server state.
             scope_checker: Optional ``ScopeChecker``.  When ``None``, scope checking
                            is disabled.
             transport:     Optional injectable HTTP transport.  Used by unit tests
@@ -339,6 +352,7 @@ class AutoReplay:
         self._state_file = Path(state_file)
         self._sessions_file = Path(sessions_file)
         self._audit = audit_log
+        self._allow_write = allow_write
         self._scope = scope_checker
         self._transport = transport
         self._rate_limiter: RateLimiter = _rate_limiter or RateLimiter(test_rps=1.0)
@@ -402,9 +416,16 @@ class AutoReplay:
         """
         method = method.upper()
 
-        # 1. Method gate — hard-coded; not configurable.
+        # 1. Method gate.
         if method not in SAFE_METHODS:
-            return False, f"unsafe method: {method}"
+            if method in WRITE_METHODS:
+                # Write methods are opt-in, not hard-blocked.
+                if not self._allow_write:
+                    return False, f"write method: {method} — rerun with --allow-write"
+                # allow_write=True: fall through; other gates still apply.
+            else:
+                # Unknown/exotic methods (CONNECT, TRACE, …) are always hard-blocked.
+                return False, f"unsafe method: {method}"
 
         # 2. Blocklist gate.
         if _is_blocked_url(url):
@@ -675,8 +696,16 @@ class AutoReplay:
                 ))
                 continue
 
-            # Real replay.
-            template = RequestTemplate(method=method, url=url)
+            # Real replay — pass body and Content-Type from the candidate entry
+            # when present (used for write-method IDOR/BAC testing).
+            body: Optional[str] = c.get("body")
+            content_type: Optional[str] = c.get("content_type")
+            base_headers: dict[str, str] = {}
+            if content_type:
+                base_headers["Content-Type"] = content_type
+            template = RequestTemplate(
+                method=method, url=url, headers=base_headers, body=body
+            )
             three_way = self._replay_three_way(template)
             classification, notes = self._classify_result(three_way)
             endpoint_key = _endpoint_path(url)
@@ -749,6 +778,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "When omitted, scope checking is disabled."
         ),
     )
+    p.add_argument(
+        "--allow-write", action="store_true", default=False,
+        help=(
+            "Allow PUT/PATCH/DELETE/POST candidates through the method gate.  "
+            "Requires explicit human approval before use — write methods can "
+            "mutate server state."
+        ),
+    )
     return p
 
 
@@ -772,6 +809,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         state_file=Path(args.state_path),
         sessions_file=Path(args.sessions),
         audit_log=audit,
+        allow_write=args.allow_write,
         scope_checker=scope,
     )
 

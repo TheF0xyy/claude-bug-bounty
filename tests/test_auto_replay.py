@@ -159,6 +159,7 @@ def _make_ar(
     scope_checker=None,
     state_data: dict | None = None,
     use_null_rate_limiter: bool = True,
+    allow_write: bool = False,
 ) -> tuple[AutoReplay, Path, Path]:
     """Build an AutoReplay instance wired to temp files.
 
@@ -185,6 +186,7 @@ def _make_ar(
         state_file=state_path,
         sessions_file=sessions_file,
         audit_log=audit,
+        allow_write=allow_write,
         scope_checker=scope_checker,
         transport=transport or _make_transport(),
         _rate_limiter=rl,
@@ -198,8 +200,9 @@ def _make_ar(
 class TestMethodGate:
     """Non-GET/HEAD methods must be blocked before any network call."""
 
-    @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-    def test_unsafe_method_is_blocked(self, tmp_path, method):
+    @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH"])
+    def test_write_method_blocked_by_default(self, tmp_path, method):
+        """Write methods produce 'write method: X — rerun with --allow-write' reason."""
         call_count = [0]
 
         def counting(m, url, h, b, t):
@@ -210,6 +213,33 @@ class TestMethodGate:
             tmp_path,
             candidates=[("/api/users/1", method)],
             transport=counting,
+        )
+        results = ar.run()
+        assert len(results) == 1
+        assert results[0].skipped is True
+        assert "write method" in results[0].skip_reason
+        assert "--allow-write" in results[0].skip_reason
+        assert call_count[0] == 0, "Transport must not be called for blocked methods"
+
+    @pytest.mark.parametrize("method", ["OPTIONS"])
+    def test_exotic_method_hard_blocked(self, tmp_path, method):
+        """Exotic/unknown methods are always hard-blocked regardless of allow_write.
+
+        Only OPTIONS is used here because CONNECT/TRACE are not in the audit
+        log schema's VALID_METHODS and would raise before the gate check.
+        OPTIONS is representative: it is neither in SAFE_METHODS nor WRITE_METHODS.
+        """
+        call_count = [0]
+
+        def counting(m, url, h, b, t):
+            call_count[0] += 1
+            return 200, b"", {}
+
+        ar, state_path, _ = _make_ar(
+            tmp_path,
+            candidates=[("/api/users/1", method)],
+            transport=counting,
+            allow_write=True,  # even with allow_write, exotic methods are blocked
         )
         results = ar.run()
         assert len(results) == 1
@@ -237,7 +267,7 @@ class TestMethodGate:
         ar, _, _ = _make_ar(tmp_path)
         safe, reason = ar._is_safe_to_replay("https://api.example.com/users", "POST")
         assert safe is False
-        assert "unsafe method" in reason
+        assert "write method" in reason
 
     def test_is_safe_to_replay_get_passes_method_gate(self, tmp_path):
         ar, _, _ = _make_ar(tmp_path)
@@ -563,12 +593,12 @@ class TestDryRun:
         assert all(r.classification is None for r in non_skipped)
 
     def test_dry_run_safety_gates_still_apply(self, tmp_path):
-        """Dry-run must still skip blocked URLs and unsafe methods."""
+        """Dry-run must still skip blocked URLs and write methods."""
         ar, _, _ = _make_ar(
             tmp_path,
             candidates=[
                 ("/admin/config", "GET"),   # blocked substring
-                ("/api/users/1", "POST"),   # unsafe method
+                ("/api/users/1", "POST"),   # write method (blocked without allow_write)
                 ("/api/orders/1", "GET"),   # should pass
             ],
         )
@@ -1129,3 +1159,175 @@ class TestHelpers:
 
     def test_endpoint_path_bare_path_unchanged(self):
         assert _endpoint_path("/api/users/1") == "/api/users/1"
+
+
+# ── --allow-write flag ────────────────────────────────────────────────────────
+
+
+class TestAllowWriteFlag:
+    """PUT/PATCH/DELETE/POST methods require allow_write=True to pass the gate."""
+
+    @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "POST"])
+    def test_write_method_blocked_by_default(self, tmp_path, method):
+        """Write methods must be skipped when allow_write is False (default)."""
+        ar, _, _ = _make_ar(
+            tmp_path,
+            candidates=[("/api/address/123", method)],
+        )
+        results = ar.run()
+        assert len(results) == 1
+        r = results[0]
+        assert r.skipped is True
+        assert "write method" in r.skip_reason
+        assert "--allow-write" in r.skip_reason
+
+    @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "POST"])
+    def test_write_method_passes_with_allow_write(self, tmp_path, method):
+        """Write methods must be allowed through the method gate when allow_write=True."""
+        # Use a transport that returns a clear idor signal so the run completes.
+        def transport_a_b_diff(m, url, h, b, t):
+            if "account_a" in str(h) or "token_a" in str(h):
+                return 200, b'{"owner":"a"}', {"content-type": "application/json"}
+            return 200, b'{"owner":"b"}', {"content-type": "application/json"}
+
+        # We need per-session differentiation; use a simpler transport.
+        call_log: list[str] = []
+
+        def counting_transport(m, url, h, b, t):
+            call_log.append(m)
+            return 200, b"ok", {}
+
+        ar, _, _ = _make_ar(
+            tmp_path,
+            candidates=[("/api/address/123", method)],
+            transport=counting_transport,
+            allow_write=True,
+        )
+        results = ar.run()
+        assert len(results) == 1
+        r = results[0]
+        # Not skipped by method gate — may be skipped by another gate or produce a result.
+        assert r.skip_reason != f"write method: {method} — rerun with --allow-write"
+        # The transport was called (method gate did not block).
+        assert len(call_log) > 0
+
+    def test_body_reaches_transport(self, tmp_path):
+        """Body stored in the candidate entry must be passed to the HTTP transport."""
+        received_bodies: list[bytes | None] = []
+
+        def capturing_transport(m, url, h, b, t):
+            received_bodies.append(b)
+            return 200, b"ok", {}
+
+        # Add a candidate with a body directly via state_manager to bypass
+        # the method gate (use GET so the method gate doesn't interfere).
+        sessions_file = _make_sessions_file(tmp_path)
+        state_path = _make_state_file(tmp_path, {})
+        audit, _ = _make_audit(tmp_path)
+
+        from memory.state_manager import add_candidate as _add_candidate
+        _add_candidate(
+            "api.example.com",
+            "/api/address/123",
+            "GET",
+            body='{"street":"test"}',
+            content_type="application/json",
+            path=state_path,
+        )
+
+        ar = AutoReplay(
+            target="api.example.com",
+            state_file=state_path,
+            sessions_file=sessions_file,
+            audit_log=audit,
+            allow_write=True,
+            transport=capturing_transport,
+            _rate_limiter=_null_rate_limiter(),
+        )
+        ar.run()
+
+        # Transport must have been called with the body bytes.
+        assert any(b == b'{"street":"test"}' for b in received_bodies), (
+            f"Expected body not found in transport calls; got: {received_bodies}"
+        )
+
+    def test_content_type_header_set_when_candidate_has_content_type(self, tmp_path):
+        """Content-Type header must be included in the request when stored in candidate."""
+        received_headers: list[dict] = []
+
+        def capturing_transport(m, url, h, b, t):
+            received_headers.append(dict(h))
+            return 200, b"ok", {}
+
+        sessions_file = _make_sessions_file(tmp_path)
+        state_path = _make_state_file(tmp_path, {})
+        audit, _ = _make_audit(tmp_path)
+
+        from memory.state_manager import add_candidate as _add_candidate
+        _add_candidate(
+            "api.example.com",
+            "/api/profile/update",
+            "GET",
+            body='{"name":"alice"}',
+            content_type="application/json",
+            path=state_path,
+        )
+
+        ar = AutoReplay(
+            target="api.example.com",
+            state_file=state_path,
+            sessions_file=sessions_file,
+            audit_log=audit,
+            allow_write=True,
+            transport=capturing_transport,
+            _rate_limiter=_null_rate_limiter(),
+        )
+        ar.run()
+
+        assert received_headers, "Transport was never called"
+        # Content-Type should appear in at least one call's headers (case-insensitive check).
+        combined = " ".join(
+            " ".join(f"{k}:{v}" for k, v in h.items()) for h in received_headers
+        ).lower()
+        assert "content-type" in combined
+        assert "application/json" in combined
+
+    def test_allow_write_cli_flag_accepted(self, tmp_path):
+        """--allow-write flag must be accepted by the CLI without error."""
+        sessions_file = _make_sessions_file(tmp_path)
+        state_path = _make_state_file(tmp_path, {})
+        audit_path = tmp_path / "audit.jsonl"
+
+        code = main([
+            "--target", "api.example.com",
+            "--sessions", str(sessions_file),
+            "--state-path", str(state_path),
+            "--audit-log", str(audit_path),
+            "--allow-write",
+            "--dry-run",
+        ])
+        # No candidates → exit 0 (no error parsing the flag).
+        assert code == 0
+
+    def test_address_update_path_reachable_with_allow_write(self, tmp_path):
+        """address/update path must NOT be hard-blocked (only write-method-gated)."""
+        call_log: list[str] = []
+
+        def transport(m, url, h, b, t):
+            call_log.append(url)
+            return 200, b"ok", {}
+
+        # With allow_write=True and a PUT method, address/update should not be
+        # in BLOCKED_PATH_SUBSTRINGS and must reach the transport.
+        ar, _, _ = _make_ar(
+            tmp_path,
+            candidates=[("/api/address/update/456", "PUT")],
+            transport=transport,
+            allow_write=True,
+        )
+        results = ar.run()
+        assert len(results) == 1
+        # Must NOT be blocked by the path blocklist.
+        assert results[0].skip_reason != "blocked path substring"
+        # Transport was called.
+        assert len(call_log) > 0

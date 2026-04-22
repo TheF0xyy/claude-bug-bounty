@@ -349,8 +349,37 @@ Iterate the ranked TSV from Step 3b **top-to-bottom**. For each row
       `(endpoint, vuln_class, method, auth_state)` tuple, then continue
       to the next class.
 
-3. After all classes exhausted (or signal handed to validation), rotate
-   to the next ranked row.
+3. After all classes exhausted (or signal handed to validation):
+
+   **Reverse inference hook** — if the current endpoint produced any
+   non-dead signal AND the endpoint has a write method in its candidates,
+   run reverse inference before rotating to the next ranked row.  This
+   probes for read IDOR on the same path and cross-account write IDOR in
+   one lightweight pass:
+
+   ```bash
+   # Run after the inner class loop completes for any endpoint with write-method signal.
+   # Only fires when the endpoint has write-method candidates in hunt_state.json.
+   WRITE_SIGNAL=$(python3 -c "
+   import sys; sys.path.insert(0, '.')
+   from memory.state_manager import get_candidates
+   w = [c for c in get_candidates('$TARGET')
+        if c.get('endpoint') == '$ENDPOINT'
+        and c.get('method','GET') not in ('GET','HEAD')]
+   print(len(w))
+   ")
+
+   if [[ "$WRITE_SIGNAL" -gt 0 ]]; then
+     python3 tools/method_inferrer.py \
+       --target   "$TARGET" \
+       --endpoints "$ENDPOINT" \
+       --mode     reverse \
+       --sessions memory/sessions.json \
+       --state-path memory/hunt_state.json
+   fi
+   ```
+
+   Rotate to the next ranked row.
 
 **Invariants** (do not break when extending Step 4):
 - Scoring (Step 3b) only **ranks** the outer loop. It never drops rows.
@@ -361,6 +390,56 @@ Iterate the ranked TSV from Step 3b **top-to-bottom**. For each row
   probe, and runs per `(endpoint, vuln_class, method, auth_state)`
   tuple. "Skip" is reserved for this gate; recommender-empty is
   "rotate" / "defer", never "skip".
+
+## Step 4a: Method Inference (write-method discovery)
+
+Before running Auto-Replay, check whether any write-method candidates exist.
+If none do, run `method_inferrer.py` to probe known GET endpoints for PUT/PATCH/DELETE
+availability and auto-populate `hunt_state.json` with write-method candidates.
+
+```bash
+# Count existing write-method candidates.
+WRITE_CANDIDATES=$(python3 -c "
+import sys; sys.path.insert(0, '.')
+from memory.state_manager import get_candidates
+write = [c for c in get_candidates('$TARGET') if c.get('method','GET') not in ('GET','HEAD')]
+print(len(write))
+")
+
+if [[ "$WRITE_CANDIDATES" -eq 0 ]]; then
+  echo "[Step 4a] No write-method candidates found — running method inferrer..."
+
+  python3 tools/method_inferrer.py \
+    --target     "$TARGET" \
+    --sessions   memory/sessions.json \
+    --state-path memory/hunt_state.json
+  INFER_EXIT=$?
+
+  if [[ $INFER_EXIT -eq 1 ]]; then
+    echo "[Step 4a] Write-method candidates added — proceeding to Auto-Replay with --allow-write"
+    echo "[Step 4a] ⚠ Human approval required before Step 4b runs --allow-write (see checkpoint)"
+  else
+    echo "[Step 4a] No write-method candidates discovered — Step 4b will run read-only"
+  fi
+else
+  echo "[Step 4a] $WRITE_CANDIDATES write-method candidate(s) already present — skipping inference"
+fi
+```
+
+**What method_inferrer.py does:**
+- Reads GET/HEAD candidates from `hunt_state.json` (or accepts `--endpoints` list)
+- For each resource endpoint (numeric ID, UUID, or resource keyword in path):
+  - Issues an OPTIONS request to check the server's `Allow` header
+  - Probes each inferred write method (PUT/PATCH; DELETE for orders/subscriptions)
+  - Classifies response: 200/201/204 → high signal; 400/422/401/403 → medium signal;
+    404/405 → skip
+  - Generates a body template from the GET response JSON for 400/422 outcomes
+  - Adds non-skip candidates to `hunt_state.json` with stored body and Content-Type
+- Uses `account_a` credentials only — this is discovery, not differential testing
+- Rate limit: 1 req/sec; scope-checked; every request logged to `audit.jsonl`
+
+**Dry-run available:** Add `--dry-run` to preview what would be probed without
+any HTTP requests or state writes.
 
 ## Step 4b: Auto-Replay
 
@@ -387,6 +466,28 @@ if [[ -f memory/sessions.json ]]; then
   fi
 fi
 ```
+
+> **`--allow-write` runs require explicit human approval — MANDATORY checkpoint.**
+> This checkpoint applies in **all modes**, including `--yolo`.
+>
+> Before passing `--allow-write` to `auto_replay.py`:
+>
+> 1. List every write-method candidate and its stored body (preview, not full dump):
+>    ```bash
+>    python3 -c "
+>    import sys; sys.path.insert(0, '.')
+>    from memory.state_manager import get_candidates
+>    for c in get_candidates('$TARGET', status='candidate'):
+>        if c.get('method','GET') not in ('GET','HEAD'):
+>            body_preview = (c.get('body') or '')[:120]
+>            print(c['method'], c['endpoint'], '|', body_preview)
+>    "
+>    ```
+> 2. Show the hunter the list and ask:
+>    **"These requests will modify server state — proceed? (yes/no)"**
+> 3. Proceed **only** if the hunter explicitly confirms with `yes`.
+>    If the answer is anything other than `yes`, abort and leave the candidates
+>    in `hunt_state.json` for manual review.
 
 **What to do before running:**
 
@@ -427,8 +528,10 @@ If `idor_candidate` entries exist, **prioritize them in Step 5 (Validate)**.
 
 - **Batch mode only.** The tool processes all pending candidates in one run,
   not one endpoint at a time.
-- **GET and HEAD only.** Any candidate with another method is automatically
-  skipped with a logged reason; it does not block the run.
+- **GET and HEAD by default.** Write-method candidates (PUT/PATCH/DELETE/POST)
+  are skipped unless `--allow-write` is passed **after explicit human approval**
+  (see the approval checkpoint above). The block is logged but does not stop
+  the run.
 - **Read-only.** No POST, no mutation, no session refresh.
 - **Safety gates enforced inside the tool:** method gate, blocklist gate,
   scope gate, dead-branch check, rate limit (1 req/sec, hard-coded),

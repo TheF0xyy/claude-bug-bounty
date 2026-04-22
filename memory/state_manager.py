@@ -213,6 +213,8 @@ def add_candidate(
     endpoint: str,
     method: str,
     *,
+    body: Optional[str] = None,
+    content_type: Optional[str] = None,
     path: Path = DEFAULT_PATH,
 ) -> None:
     """Add an endpoint to the candidates list for auto-replay testing.
@@ -222,10 +224,16 @@ def add_candidate(
     a status update does not reset the result.
 
     Args:
-        target:   Hostname key (e.g. "api.target.com").
-        endpoint: Path or URL of the candidate endpoint.
-        method:   HTTP verb (e.g. "GET").
-        path:     Path to hunt_state.json.
+        target:       Hostname key (e.g. "api.target.com").
+        endpoint:     Path or URL of the candidate endpoint.
+        method:       HTTP verb (e.g. "GET", "PUT").
+        body:         Optional request body for write-method candidates.
+                      Stored as a plain string; auto_replay passes it as the
+                      request body when replaying.  None for GET/HEAD.
+        content_type: Optional MIME type for the body (e.g.
+                      "application/json").  Stored alongside body and used
+                      to set the Content-Type header during replay.
+        path:         Path to hunt_state.json.
     """
     with _locked_state(Path(path)) as full:
         bucket = full.setdefault(target, {"dead_branches": []})
@@ -234,12 +242,17 @@ def add_candidate(
         for c in candidates:
             if (c.get("endpoint"), c.get("method")) == key:
                 return  # already present; do not reset status
-        candidates.append({
+        entry: dict = {
             "endpoint": endpoint,
             "method": method.upper(),
             "status": "candidate",
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        })
+        }
+        if body is not None:
+            entry["body"] = body
+        if content_type is not None:
+            entry["content_type"] = content_type
+        candidates.append(entry)
 
 
 def get_candidates(

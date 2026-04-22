@@ -22,26 +22,45 @@ at least one (ideally two) accounts.
 
 ## Step 1 — Fetch Proxy History for Target
 
-Call the MCP tool `get_proxy_http_history_regex` with:
+Paginate through **all** matching history entries before proceeding.
+
+**Page loop:**
 
 ```
-tool: get_proxy_http_history_regex
-params:
-  regex: "target\\.com"
-  count: 100
-  offset: 0
+offset = 0
+all_entries = []
+
+loop:
+  Call get_proxy_http_history_regex with:
+    regex: "target\\.com"
+    count: 100
+    offset: <current offset>
+
+  If the tool is not available (Burp MCP not connected):
+    Jump to Fallback: Burp Not Connected below.
+
+  Append returned entries to all_entries.
+
+  If fewer than 100 entries were returned this page:
+    Stop — this is the last page.
+  Else:
+    offset += 100
+    Continue loop.
 ```
 
-**If the tool is not available (Burp MCP not connected):** Jump to
-[Fallback: Burp Not Connected](#fallback-burp-not-connected) below.
+**After collecting all pages:**
 
-**If fewer than 5 results are returned:** Tell the user:
+- `total = len(all_entries)`
+- If `total < 5`: tell the user:
 
 > Not enough Burp history for target.com — only N entries found.
 > Browse target.com while logged in through the Burp proxy, then
 > re-run `/burp-bootstrap target.com`.
 
 Stop here.
+
+All subsequent steps (Step 2 onward) operate on the complete `all_entries`
+collection, not just the first page.
 
 ---
 
@@ -65,7 +84,8 @@ From the passing entries, keep the **top 30** sorted by URL length descending
 
 ## Step 3 — Detect Distinct Accounts
 
-Parse the `Authorization` header from each filtered request.
+Parse the `Authorization` header from each filtered request in the full
+filtered set (drawn from all pages collected in Step 1).
 
 **Group entries by their exact `Authorization` header value.**
 
