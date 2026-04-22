@@ -152,14 +152,72 @@ surfaces them earlier in the post-login queue.
 Iterate the ranked TSV from Step 3b **top-to-bottom**. For each row
 `(SCORE, METHOD, ENDPOINT)`:
 
-1. **Dead-branch check** (see `## Dead-Branch Memory` below). If
-   `(endpoint, vuln_class, method, auth_state)` is dead, skip to the next
-   row and do not issue any request. This gate is independent of scoring.
-2. Select vuln class based on tech stack + URL pattern + memory
-3. Test with appropriate technique
-4. Log every request to audit.jsonl
-5. If signal found → check chain table (A→B)
-6. If 5 minutes with no progress → **record dead branch with `reason=no_signal`**, then rotate to next endpoint
+1. **Recommend vuln classes** for this endpoint via the deterministic
+   recommender (see `tools/vuln_recommender.py`). The CLI wrapper prints
+   the priority-ordered class list one per line:
+
+   ```bash
+   mapfile -t CLASSES < <(
+     python3 tools/recommend.py \
+       --endpoint "$ENDPOINT" --method "$METHOD" --auth-state "$AUTH_STATE"
+   )
+   ```
+
+   If `CLASSES` is **empty**, the recommender has no hypothesis for this
+   `(endpoint, method, auth_state)` triple under the *current* context.
+   Treat this as **rotate / defer**, not skip:
+
+   - **Rotate**: move to the next ranked row in this iteration; do not
+     issue any request for this endpoint right now.
+   - **Defer, do NOT mark dead**: the endpoint is **not** considered
+     dead. Do **not** call `tools/hunt_state.py record`, do **not**
+     write anything to `memory/hunt_state.json`, and do **not** prune it
+     from the candidate set. "No recommendation" is a context-dependent
+     verdict, not a permanent one.
+   - **Re-evaluation**: the endpoint **must remain eligible** for future
+     runs. The recommender is a pure function of
+     `(endpoint, method, auth_state)`, so its output can change when
+     **any** of those inputs change. Concretely, the same endpoint may
+     surface classes after:
+       - `$AUTH_STATE` flips (`anonymous` → `authenticated` after login,
+         or vice versa on session loss),
+       - the same endpoint is re-tried with a different `$METHOD`
+         (e.g. `POST` after a `GET` returned no classes), or
+       - the recommender's rule tables are extended in a later patch.
+
+   Wording rule (avoid confusion with the dead-branch gate): use
+   **"rotate"** or **"defer"** when describing this branch. Reserve the
+   word **"skip"** for the dead-branch gate in step 2a, where it has a
+   precise meaning ("a request was suppressed because
+   `(endpoint, vuln_class, method, auth_state)` is recorded dead").
+
+2. For each `VULN_CLASS` in `CLASSES` (highest priority first):
+
+   a. **Dead-branch check** (see `## Dead-Branch Memory` below). If
+      `(endpoint, vuln_class, method, auth_state)` is dead, skip this
+      `(endpoint, class)` pair and continue to the next class. This gate
+      is independent of scoring and of the recommender.
+   b. Test with the technique appropriate to `VULN_CLASS`.
+   c. Log every request to `audit.jsonl`.
+   d. If signal found → check chain table (A→B), then break out of the
+      class loop for this endpoint and proceed to validation.
+   e. If 5 minutes on this `(endpoint, class)` pair with no progress →
+      **record dead branch with `reason=no_signal`** for that exact
+      `(endpoint, vuln_class, method, auth_state)` tuple, then continue
+      to the next class.
+
+3. After all classes exhausted (or signal handed to validation), rotate
+   to the next ranked row.
+
+**Invariants** (do not break when extending Step 4):
+- Scoring (Step 3b) only **ranks** the outer loop. It never drops rows.
+- The recommender only **suggests** classes for the inner loop. An empty
+  list means **rotate / defer** (re-evaluable next run); it never marks
+  a branch dead and never writes to `hunt_state.json`.
+- The dead-branch gate is the **sole** authority for **skipping** a
+  probe, and runs per `(endpoint, vuln_class, method, auth_state)`
+  tuple. "Skip" is reserved for this gate; recommender-empty is
+  "rotate" / "defer", never "skip".
 
 ## Step 5: Validate
 
