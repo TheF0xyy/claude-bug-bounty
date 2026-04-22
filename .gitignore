@@ -33,3 +33,4 @@ nmap-output/
 
 # Dead-branch memory (per-machine)
 memory/hunt_state.json
+memory/.hunt_state.lock
