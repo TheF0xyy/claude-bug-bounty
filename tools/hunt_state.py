@@ -3,6 +3,14 @@
 
 Used by agents/autopilot.md so the markdown never has to embed Python.
 Logic lives in memory/state_manager.py; this file is just argparse plumbing.
+
+Context-aware flags (added in the MVP hardening pass):
+
+    --vuln-class   class being tested (empty string = wildcard / null)
+    --method       HTTP method being tested (empty string = wildcard / null)
+    --auth-state   one of anonymous|authenticated, or empty string for wildcard
+
+Empty strings are normalized to None at the boundary and stored as JSON null.
 """
 
 import argparse
@@ -16,10 +24,29 @@ if str(REPO_ROOT) not in sys.path:
 
 from memory.state_manager import (  # noqa: E402
     DEFAULT_PATH,
+    VALID_AUTH_STATES,
     VALID_REASONS,
     is_dead_branch,
     mark_dead_branch,
 )
+
+
+def _add_context_args(sub: argparse.ArgumentParser) -> None:
+    """Flags shared by both `check` and `record`."""
+    sub.add_argument("--target", required=True)
+    sub.add_argument("--endpoint", required=True)
+    sub.add_argument(
+        "--vuln-class", default="",
+        help="Vuln class; empty string = wildcard (null).",
+    )
+    sub.add_argument(
+        "--method", default="",
+        help="HTTP method (GET/POST/...); empty string = wildcard (null).",
+    )
+    sub.add_argument(
+        "--auth-state", default="", choices=("", *VALID_AUTH_STATES),
+        help="Auth context; empty string = wildcard (null).",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -35,29 +62,42 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("check", help="Exit 0 if (endpoint, vuln_class) is dead, 1 otherwise.")
-    c.add_argument("--target", required=True)
-    c.add_argument("--endpoint", required=True)
-    c.add_argument("--vuln-class", default="", help='Vuln class; empty string = wildcard (null)')
+    c = sub.add_parser(
+        "check",
+        help="Exit 0 if (endpoint, vuln_class, method, auth_state) is dead, 1 otherwise.",
+    )
+    _add_context_args(c)
 
     r = sub.add_parser("record", help="Record a dead-branch entry. Always exits 0 on success.")
-    r.add_argument("--target", required=True)
-    r.add_argument("--endpoint", required=True)
-    r.add_argument("--vuln-class", default="", help='Vuln class; empty string = wildcard (null)')
+    _add_context_args(r)
     r.add_argument("--reason", required=True, choices=list(VALID_REASONS))
 
     return p
 
 
+def _normalize(value: str) -> str | None:
+    """Empty string → None (wildcard). Otherwise return the string as-is."""
+    return value or None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    vc = args.vuln_class or None
+    vc = _normalize(args.vuln_class)
+    method = _normalize(args.method)
+    auth_state = _normalize(args.auth_state)
     path = Path(args.state_file)
 
     if args.cmd == "check":
-        return 0 if is_dead_branch(args.target, args.endpoint, vc, path=path) else 1
+        dead = is_dead_branch(
+            args.target, args.endpoint, vc,
+            method=method, auth_state=auth_state, path=path,
+        )
+        return 0 if dead else 1
 
-    mark_dead_branch(args.target, args.endpoint, vc, args.reason, path=path)
+    mark_dead_branch(
+        args.target, args.endpoint, vc, args.reason,
+        method=method, auth_state=auth_state, path=path,
+    )
     return 0
 
 

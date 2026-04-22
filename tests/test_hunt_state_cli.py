@@ -1,5 +1,7 @@
-"""Tests for tools/hunt_state.py — check, record, bad reason, wildcard."""
+"""Tests for tools/hunt_state.py — check, record, bad reason, wildcard,
+and context-aware matching on method / auth_state."""
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -83,3 +85,178 @@ def test_empty_vuln_class_is_wildcard(state_file):
             state_file=state_file,
         )
         assert chk.returncode == 0, f"wildcard should match vuln_class={vc!r}"
+
+
+# --- context-aware matching: method ----------------------------------------
+
+def test_get_dead_does_not_skip_post(state_file):
+    """Recording a dead GET must NOT make the same endpoint look dead for POST."""
+    rec = run_cli(
+        "record", "--target", "example.com",
+        "--endpoint", "/api/items", "--vuln-class", "idor",
+        "--method", "GET", "--reason", "no_signal",
+        state_file=state_file,
+    )
+    assert rec.returncode == 0
+
+    chk_get = run_cli(
+        "check", "--target", "example.com",
+        "--endpoint", "/api/items", "--vuln-class", "idor",
+        "--method", "GET",
+        state_file=state_file,
+    )
+    assert chk_get.returncode == 0, "GET probe should match stored GET dead branch"
+
+    chk_post = run_cli(
+        "check", "--target", "example.com",
+        "--endpoint", "/api/items", "--vuln-class", "idor",
+        "--method", "POST",
+        state_file=state_file,
+    )
+    assert chk_post.returncode == 1, "POST probe must NOT match a GET-only dead branch"
+
+
+def test_empty_method_is_wildcard_on_stored_side(state_file):
+    """Record without --method → stored null → matches any method probe."""
+    rec = run_cli(
+        "record", "--target", "example.com",
+        "--endpoint", "/api/widgets", "--vuln-class", "idor",
+        "--reason", "no_signal",
+        state_file=state_file,
+    )
+    assert rec.returncode == 0
+
+    for m in ("GET", "POST", "PUT", ""):
+        chk = run_cli(
+            "check", "--target", "example.com",
+            "--endpoint", "/api/widgets", "--vuln-class", "idor",
+            "--method", m,
+            state_file=state_file,
+        )
+        assert chk.returncode == 0, f"wildcard method entry should match method={m!r}"
+
+
+# --- context-aware matching: auth_state ------------------------------------
+
+def test_anonymous_dead_does_not_skip_authenticated(state_file):
+    """Anonymous dead must NOT cause a skip under authenticated context."""
+    rec = run_cli(
+        "record", "--target", "example.com",
+        "--endpoint", "/api/me", "--vuln-class", "idor",
+        "--auth-state", "anonymous", "--reason", "no_signal",
+        state_file=state_file,
+    )
+    assert rec.returncode == 0
+
+    chk_anon = run_cli(
+        "check", "--target", "example.com",
+        "--endpoint", "/api/me", "--vuln-class", "idor",
+        "--auth-state", "anonymous",
+        state_file=state_file,
+    )
+    assert chk_anon.returncode == 0, "anonymous probe should match stored anonymous dead"
+
+    chk_auth = run_cli(
+        "check", "--target", "example.com",
+        "--endpoint", "/api/me", "--vuln-class", "idor",
+        "--auth-state", "authenticated",
+        state_file=state_file,
+    )
+    assert chk_auth.returncode == 1, (
+        "authenticated probe must NOT match an anonymous-only dead branch"
+    )
+
+
+def test_invalid_auth_state_fails(state_file):
+    """CLI should reject typos to prevent silent false skips."""
+    result = run_cli(
+        "record", "--target", "example.com",
+        "--endpoint", "/api/me", "--vuln-class", "idor",
+        "--auth-state", "anon", "--reason", "no_signal",
+        state_file=state_file,
+    )
+    assert result.returncode != 0
+    assert "invalid choice" in result.stderr.lower()
+    assert not state_file.exists()
+
+
+# --- backward compatibility ------------------------------------------------
+
+def test_legacy_entry_without_context_fields_still_matches(state_file, tmp_path):
+    """A legacy entry (no method, no auth_state keys) must still match probes.
+
+    This preserves pre-patch behavior for already-written hunt_state.json files.
+    """
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps({
+        "example.com": {
+            "dead_branches": [
+                {
+                    "endpoint": "/legacy",
+                    "vuln_class": "idor",
+                    "reason": "no_signal",
+                    "ts": "2026-04-21T00:00:00Z",
+                }
+            ]
+        }
+    }))
+
+    for m, auth in (("GET", "anonymous"), ("POST", "authenticated"), ("", "")):
+        chk = run_cli(
+            "check", "--target", "example.com",
+            "--endpoint", "/legacy", "--vuln-class", "idor",
+            "--method", m, "--auth-state", auth,
+            state_file=state_file,
+        )
+        assert chk.returncode == 0, (
+            f"legacy entry should match probe method={m!r} auth_state={auth!r}"
+        )
+
+
+def test_record_persists_new_context_fields(state_file):
+    """Written entries should include the new keys in the JSON on disk."""
+    rec = run_cli(
+        "record", "--target", "example.com",
+        "--endpoint", "/api/items", "--vuln-class", "idor",
+        "--method", "POST", "--auth-state", "authenticated",
+        "--reason", "rejected",
+        state_file=state_file,
+    )
+    assert rec.returncode == 0
+
+    data = json.loads(state_file.read_text())
+    branches = data["example.com"]["dead_branches"]
+    assert len(branches) == 1
+    b = branches[0]
+    assert b["method"] == "POST"
+    assert b["auth_state"] == "authenticated"
+    assert b["vuln_class"] == "idor"
+    assert b["reason"] == "rejected"
+
+
+def test_dedup_respects_method_and_auth_state(state_file):
+    """Two records differing only in method should both be stored (not deduped)."""
+    for m in ("GET", "POST"):
+        rec = run_cli(
+            "record", "--target", "example.com",
+            "--endpoint", "/api/items", "--vuln-class", "idor",
+            "--method", m, "--auth-state", "anonymous",
+            "--reason", "no_signal",
+            state_file=state_file,
+        )
+        assert rec.returncode == 0
+
+    # Repeat the GET record — this one should dedup.
+    rec = run_cli(
+        "record", "--target", "example.com",
+        "--endpoint", "/api/items", "--vuln-class", "idor",
+        "--method", "GET", "--auth-state", "anonymous",
+        "--reason", "no_signal",
+        state_file=state_file,
+    )
+    assert rec.returncode == 0
+
+    data = json.loads(state_file.read_text())
+    branches = data["example.com"]["dead_branches"]
+    methods = sorted(b["method"] for b in branches)
+    assert methods == ["GET", "POST"], branches
