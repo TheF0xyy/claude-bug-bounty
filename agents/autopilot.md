@@ -72,39 +72,76 @@ Actions: [r]eport | [e]xpand surface | [s]top
 
 ## Step 0: Auth Check
 
+### Step 0a: Verify sessions.json exists
+
+Before checking session validity, confirm that `memory/sessions.json` exists
+and contains at least one account entry.
+
+```bash
+if [ ! -s memory/sessions.json ]; then
+    echo "[AUTOPILOT] memory/sessions.json is missing or empty."
+fi
+```
+
+**If `memory/sessions.json` is missing or empty:**
+
+- **If Burp MCP is connected (port 9876):**
+
+  > `memory/sessions.json` is missing. Running `/burp-bootstrap {target}`
+  > to auto-extract sessions from Burp proxy history.
+
+  Run `/burp-bootstrap {target}` now. Do not proceed until `sessions.json`
+  contains at least `account_a`. Re-check after bootstrap completes.
+
+- **If Burp MCP is NOT connected:**
+
+  > `memory/sessions.json` is missing and Burp MCP is not connected.
+  > Please do one of the following before continuing:
+  >
+  > 1. Connect Burp MCP (port 9876) and run `/burp-bootstrap {target}`
+  > 2. Or paste two raw HTTP requests (one per account) so sessions can be
+  >    built with `python3.13 tools/session_bootstrap.py`
+
+  Wait for user input. Do not proceed until `sessions.json` is populated.
+
+### Step 0b: Validate session freshness
+
 Before loading scope or touching the network, verify that stored sessions are
 still valid.  This prevents hunting under expired credentials and wasting time
 on access-control tests that return 401/403 for the wrong reason.
 
 ```bash
-# Default: reads memory/sessions.json, validates, exits 1 on any expiry.
-if ! python3 tools/auth_check.py; then
-    echo "[AUTOPILOT] Stopped: fix expired sessions before retrying." >&2
-    exit 1
-fi
+python3.13 tools/check_sessions.py \
+    --sessions memory/sessions.json \
+    --probe-url https://{target}/api/me
+SESSION_CHECK_EXIT=$?
 ```
 
-**With a custom sessions path:**
-```bash
-if ! python3 tools/auth_check.py --sessions /path/to/sessions.json; then
-    exit 1
-fi
-```
+**Exit code handling (non-negotiable):**
 
-**Skip check (use only when sessions.json is absent or probe URLs are not
-configured yet):**
-```bash
-python3 tools/auth_check.py --skip-auth-check
+```
+exit 0 → All sessions valid (or unchecked). Proceed to Step 1.
+
+exit 1 → STOP.
+         Print: "Session expired. Re-login in Burp and re-run
+         /burp-bootstrap {target}. Do not hunt with expired sessions —
+         all auth tests will give false results."
+
+exit 2 → STOP.
+         Print: "No sessions found. Run /burp-bootstrap {target} first."
+
+exit 3 → STOP.
+         Print: "Network error. Is target reachable? Is Burp proxy running?"
 ```
 
 **Rules:**
-- `account_a` or `account_b` returns `EXPIRED/UNAUTHORIZED` → **STOP**.
-  Print `Session expired: re-capture before continuing` and exit.
-- Any session is `UNCHECKED` (no `probe_url` configured) → **continue**.
+- `account_a` or `account_b` returns `EXPIRED_OR_UNAUTHORIZED` → **exit 1**.
+- `UNCHECKED` (no `probe_url` configured) → non-blocking, hunt proceeds.
   This is the expected state when sessions.json is freshly captured and no
-  probe URLs have been added yet.
-- `no_auth` is **always allowed** — its state never blocks.
-- `NETWORK_ERROR` → print a warning, continue (don't block on connectivity).
+  probe URL has been configured yet.
+- `no_auth` is **always skipped** — it is never validated and never blocks.
+- `NETWORK_ERROR` → **exit 3** (unlike the older auth_check.py, network
+  failures are treated as blocking so you don't hunt through a dead proxy).
 
 **Non-goals (critical — do NOT do these):**
 - Do NOT refresh or re-login automatically.
@@ -113,17 +150,17 @@ python3 tools/auth_check.py --skip-auth-check
 
 **Expected output (all valid):**
 ```
-[Auth Check]
-  account_a: VALID (120ms)
-  account_b: VALID (98ms)
-  no_auth: UNCHECKED
+[Session Check]
+  account_a       VALID                     (120ms)     https://target.com/api/me
+  account_b       VALID                     (98ms)      https://target.com/api/me
+  no_auth         PROBE_NOT_CONFIGURED      (skipped)
 ```
 
 **Expected output (expired — hunt stops):**
 ```
-[Auth Check]
-  account_a: EXPIRED
-→ STOPPED: re-capture expired session(s) before continuing
+[Session Check]
+  account_a       EXPIRED                               https://target.com/api/me
+                  → re-login in Burp and re-run /burp-bootstrap
 ```
 
 ## Step 1: Scope Loading
@@ -324,6 +361,85 @@ Iterate the ranked TSV from Step 3b **top-to-bottom**. For each row
   probe, and runs per `(endpoint, vuln_class, method, auth_state)`
   tuple. "Skip" is reserved for this gate; recommender-empty is
   "rotate" / "defer", never "skip".
+
+## Step 4b: Auto-Replay
+
+After the main hunt loop (Step 4) has finished processing its current
+batch of ranked endpoints, run the automated IDOR/BAC differential test
+against all endpoints that were marked as candidates during hunting.
+
+```bash
+# Run after the Step 4 hunt loop completes for the current batch.
+# The tool reads all "candidate" entries from hunt_state.json and processes
+# them in batch.  Exit 1 means at least one idor_candidate was found.
+
+if [[ -f memory/sessions.json ]]; then
+  python3 tools/auto_replay.py \
+    --target     "$TARGET" \
+    --state-path memory/hunt_state.json \
+    --sessions   memory/sessions.json
+  AUTO_EXIT=$?
+
+  if [[ $AUTO_EXIT -eq 1 ]]; then
+    echo "[AUTO-REPLAY] idor_candidate entries found — review in Step 5 (Validate)"
+  elif [[ $AUTO_EXIT -eq 2 ]]; then
+    echo "[AUTO-REPLAY WARNING] Configuration error — check sessions.json"
+  fi
+fi
+```
+
+**What to do before running:**
+
+Before this step, any endpoint that the hunt loop has identified as
+worth cross-account testing should be recorded as a candidate:
+
+```bash
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from memory.state_manager import add_candidate
+add_candidate('$TARGET', '$ENDPOINT', '$METHOD')
+"
+```
+
+**Classification outcomes written to `hunt_state.json`:**
+
+| Status | Meaning |
+|---|---|
+| `idor_candidate` | Diff detected between sessions → SIGNAL, escalate to Step 5 |
+| `dead` | All 401/403 or no differential signal → dead branch recorded |
+| `needs_manual_review` | All 200, identical bodies → hunter must inspect manually |
+
+**Reading results before proceeding to VALIDATE:**
+
+```bash
+# Check for idor_candidate entries before Step 5.
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from memory.state_manager import get_candidates
+for c in get_candidates('$TARGET', status='idor_candidate'):
+    print(c['endpoint'], c.get('diff_summary', ''))
+"
+```
+
+If `idor_candidate` entries exist, **prioritize them in Step 5 (Validate)**.
+
+**Rules for this step:**
+
+- **Batch mode only.** The tool processes all pending candidates in one run,
+  not one endpoint at a time.
+- **GET and HEAD only.** Any candidate with another method is automatically
+  skipped with a logged reason; it does not block the run.
+- **Read-only.** No POST, no mutation, no session refresh.
+- **Safety gates enforced inside the tool:** method gate, blocklist gate,
+  scope gate, dead-branch check, rate limit (1 req/sec, hard-coded),
+  circuit breaker (3 consecutive 4xx → stop that host for this run).
+- **Signals ONLY.** `idor_candidate` is a prompt to investigate, not a
+  confirmed vulnerability. Run the 7-Question Gate in Step 5 before writing
+  any report.
+- **Credential privacy.** Authorization header values and cookie values are
+  never written to the audit log.
+- **Dry-run available.** Add `--dry-run` to verify configuration before a
+  real run: safety gates fire but no HTTP requests are made.
 
 ## Step 5: Validate
 

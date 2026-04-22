@@ -3,7 +3,7 @@
 import json
 import pytest
 
-from tools.recon_adapter import ReconAdapter
+from tools.recon_adapter import ReconData as ReconAdapter
 
 
 @pytest.fixture

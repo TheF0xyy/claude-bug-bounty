@@ -157,6 +157,164 @@ def mark_dead_branch(
         })
 
 
+def add_signal(
+    target: str,
+    endpoint: str,
+    method: str,
+    vuln_class: str,
+    diff_summary: str,
+    *,
+    path: Path = DEFAULT_PATH,
+) -> None:
+    """Record a differential testing signal in hunt_state.json.
+
+    Signals are stored in a 'signals' list under the target key.
+    Each entry is a SIGNAL (observable difference between account contexts),
+    not a confirmed finding — callers must validate through the 7-Question Gate.
+    Signals are append-only and never deduplicated (repeated probes may yield
+    new signal detail).
+
+    Args:
+        target:       Hostname key (e.g. "api.target.com").
+        endpoint:     Path or URL that produced the signal.
+        method:       HTTP verb used in the probe.
+        vuln_class:   Vuln class the signal is associated with (e.g. "idor").
+        diff_summary: Human-readable summary from DiffResult.summary().
+        path:         Path to hunt_state.json.
+    """
+    with _locked_state(Path(path)) as full:
+        bucket = full.setdefault(target, {"dead_branches": []})
+        signals = bucket.setdefault("signals", [])
+        signals.append({
+            "endpoint": endpoint,
+            "method": method,
+            "vuln_class": vuln_class,
+            "diff_summary": diff_summary,
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+
+
+def get_signals(target: str, *, path: Path = DEFAULT_PATH) -> list[dict]:
+    """Return the list of differential testing signals for a target.
+
+    Args:
+        target: Hostname key (e.g. "api.target.com").
+        path:   Path to hunt_state.json.
+
+    Returns:
+        List of signal dicts in insertion order.  Empty list when no signals.
+    """
+    full = _read_all(Path(path))
+    return list(full.get(target, {}).get("signals", []))
+
+
+def add_candidate(
+    target: str,
+    endpoint: str,
+    method: str,
+    *,
+    path: Path = DEFAULT_PATH,
+) -> None:
+    """Add an endpoint to the candidates list for auto-replay testing.
+
+    Candidates are deduplicated by (endpoint, method).  If the same pair
+    already exists in any status, this call is a no-op so re-adding after
+    a status update does not reset the result.
+
+    Args:
+        target:   Hostname key (e.g. "api.target.com").
+        endpoint: Path or URL of the candidate endpoint.
+        method:   HTTP verb (e.g. "GET").
+        path:     Path to hunt_state.json.
+    """
+    with _locked_state(Path(path)) as full:
+        bucket = full.setdefault(target, {"dead_branches": []})
+        candidates = bucket.setdefault("candidates", [])
+        key = (endpoint, method.upper())
+        for c in candidates:
+            if (c.get("endpoint"), c.get("method")) == key:
+                return  # already present; do not reset status
+        candidates.append({
+            "endpoint": endpoint,
+            "method": method.upper(),
+            "status": "candidate",
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+
+
+def get_candidates(
+    target: str,
+    *,
+    status: Optional[str] = None,
+    path: Path = DEFAULT_PATH,
+) -> list[dict]:
+    """Return the candidates list for a target, optionally filtered by status.
+
+    Args:
+        target: Hostname key (e.g. "api.target.com").
+        status: If given, only return candidates whose status equals this value.
+                Pass None to return all candidates regardless of status.
+        path:   Path to hunt_state.json.
+
+    Returns:
+        List of candidate dicts in insertion order.
+    """
+    full = _read_all(Path(path))
+    candidates = list(full.get(target, {}).get("candidates", []))
+    if status is not None:
+        candidates = [c for c in candidates if c.get("status") == status]
+    return candidates
+
+
+def update_candidate(
+    target: str,
+    endpoint: str,
+    method: str,
+    status: str,
+    *,
+    notes: str = "",
+    diff_summary: str = "",
+    path: Path = DEFAULT_PATH,
+) -> None:
+    """Update the status (and optional notes/diff_summary) of a candidate.
+
+    If the (endpoint, method) pair does not yet exist it is inserted with
+    the given status so callers need not pre-create entries with add_candidate.
+
+    Args:
+        target:       Hostname key (e.g. "api.target.com").
+        endpoint:     Path or URL identifying the candidate.
+        method:       HTTP verb (compared case-insensitively; stored upper-cased).
+        status:       New status string (e.g. "idor_candidate", "dead",
+                      "needs_manual_review").
+        notes:        Optional human-readable context for the status.
+        diff_summary: Optional diff text to attach.
+        path:         Path to hunt_state.json.
+    """
+    method = method.upper()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _locked_state(Path(path)) as full:
+        bucket = full.setdefault(target, {"dead_branches": []})
+        candidates = bucket.setdefault("candidates", [])
+        key = (endpoint, method)
+        for c in candidates:
+            if (c.get("endpoint"), c.get("method")) == key:
+                c["status"] = status
+                c["ts"] = ts
+                if notes:
+                    c["notes"] = notes
+                if diff_summary:
+                    c["diff_summary"] = diff_summary
+                return
+        # Not found — insert a new entry.
+        entry: dict = {"endpoint": endpoint, "method": method, "status": status, "ts": ts}
+        if notes:
+            entry["notes"] = notes
+        if diff_summary:
+            entry["diff_summary"] = diff_summary
+        candidates.append(entry)
+
+
 def is_dead_branch(
     target: str,
     endpoint: str,
