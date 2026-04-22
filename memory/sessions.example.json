@@ -1,0 +1,22 @@
+[
+  {
+    "name": "account_a",
+    "cookies": {
+      "session": "REPLACE_WITH_ACCOUNT_A_SESSION_COOKIE"
+    },
+    "auth_header": "Bearer REPLACE_WITH_ACCOUNT_A_JWT",
+    "notes": "low-privilege user A — victim account (e.g. test+a@example.com)"
+  },
+  {
+    "name": "account_b",
+    "cookies": {
+      "session": "REPLACE_WITH_ACCOUNT_B_SESSION_COOKIE"
+    },
+    "auth_header": "Bearer REPLACE_WITH_ACCOUNT_B_JWT",
+    "notes": "low-privilege user B — cross-account probe (e.g. test+b@example.com)"
+  },
+  {
+    "name": "no_auth",
+    "notes": "unauthenticated probe — auth-bypass check. No cookies or auth_header needed."
+  }
+]

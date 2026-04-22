@@ -7,6 +7,9 @@ config.json
 *.burp
 *.json.bak
 
+# Stored session credentials (real tokens — never commit)
+memory/sessions.json
+
 # API keys and tokens
 .env
 secrets.txt
