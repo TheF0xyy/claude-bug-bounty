@@ -142,40 +142,89 @@ Shape (top-level keys are target hostnames):
 {
   "example.com": {
     "dead_branches": [
-      {"endpoint": "...", "vuln_class": "idor", "reason": "no_signal", "ts": "..."}
+      {
+        "endpoint": "...",
+        "vuln_class": "idor",
+        "method": "GET",
+        "auth_state": "anonymous",
+        "reason": "no_signal",
+        "ts": "..."
+      }
     ]
   }
 }
 ```
 
 Reasons (closed set): `no_signal`, `rejected`, `out_of_scope`.
-`vuln_class` may be `null` — means endpoint is dead for every class (used by scope fails).
-Dedup key is `(endpoint, vuln_class, reason)` within a target. No TTL.
+Auth states (closed set): `anonymous`, `authenticated`.
+`vuln_class`, `method`, `auth_state` may each be `null` on the **stored** side
+only — `null` means "wildcard, matches any probe value on this dimension".
+Dedup key is `(endpoint, vuln_class, method, auth_state, reason)` within a
+target. No TTL.
+
+**Context-aware matching (critical to avoid false skips):**
+- Stored `null` matches any probe value.
+- Stored non-null must equal the probe exactly.
+- A probe with a **specific** context will NOT match a stored entry tagged
+  with a **different** specific context. Concretely:
+  - GET dead does NOT skip POST.
+  - Anonymous dead does NOT skip authenticated.
+  - Class `idor` dead does NOT skip class `xss`.
+- Legacy entries written before the context-aware patch have no `method` /
+  `auth_state` keys; missing keys read as `null` (wildcard), so old state
+  files keep working with zero migration.
 
 All ops go through the `tools/hunt_state.py` CLI (a thin wrapper over
-`memory/state_manager.py`). An empty `--vuln-class ""` stores as `null` →
-wildcard. `check` exits 0 when the branch is dead (Bash-true for `if`).
+`memory/state_manager.py`). Any empty-string flag (`--vuln-class ""`,
+`--method ""`, `--auth-state ""`) stores as `null` → wildcard. `check` exits
+0 when the branch is dead (Bash-true for `if`).
 
 ### Check (before any test)
 ```bash
 if python3 tools/hunt_state.py check \
-     --target "$TARGET" --endpoint "$ENDPOINT" --vuln-class "$VULN_CLASS"; then
-  echo "SKIP: dead branch ($ENDPOINT / $VULN_CLASS)"
-  # caller must skip this (endpoint, class) pair
+     --target "$TARGET" --endpoint "$ENDPOINT" \
+     --vuln-class "$VULN_CLASS" --method "$METHOD" \
+     --auth-state "$AUTH_STATE"; then
+  echo "SKIP: dead branch ($ENDPOINT $METHOD / $VULN_CLASS / $AUTH_STATE)"
+  # caller must skip this (endpoint, class, method, auth) tuple
 fi
 ```
 
 ### Record (rotation, DROP, or scope fail)
 ```bash
 python3 tools/hunt_state.py record \
-  --target "$TARGET" --endpoint "$ENDPOINT" --vuln-class "$VULN_CLASS" \
-  --reason "$REASON"
+  --target "$TARGET" --endpoint "$ENDPOINT" \
+  --vuln-class "$VULN_CLASS" --method "$METHOD" \
+  --auth-state "$AUTH_STATE" --reason "$REASON"
 ```
 
 Call-site reason mapping:
-- Step 1 scope fail → `REASON=out_of_scope`, `VULN_CLASS=""` (stored as null)
-- Step 4 rotation → `REASON=no_signal`
-- Step 5 Gate DROP → `REASON=rejected`
+- Step 1 scope fail → `REASON=out_of_scope`, `VULN_CLASS=""`, `METHOD=""`,
+  `AUTH_STATE=""` (all null — the endpoint is dead in every context).
+- Step 4 rotation → `REASON=no_signal`. Always pass the **actual** `METHOD`
+  and `AUTH_STATE` the probe used, so a later retry under a different context
+  is not falsely skipped.
+- Step 5 Gate DROP → `REASON=rejected`. Same — pass the context the finding
+  was tested in.
+
+### Context transitions
+
+`$AUTH_STATE` must flip from `anonymous` to `authenticated` the moment the
+hunt loop obtains a session. After that flip, every previously-recorded
+anonymous dead branch becomes re-testable automatically (because the new
+probe's `auth_state` no longer matches the stored `anonymous`).
+
+### MVP carve-out for identity-sensitive classes
+
+Until role context (user id / tier) lands, `authenticated` collapses all
+accounts into one bucket. For **identity-sensitive classes** (IDOR,
+access-control, authz) during per-account testing, do NOT record `no_signal`
+under `AUTH_STATE=authenticated` — otherwise switching from user A to user B
+would falsely skip. Either:
+- hold off on the record until role context is available, or
+- record with `AUTH_STATE=""` only when the finding is truly identity-agnostic.
+
+`rejected` (Gate DROP) is still safe to record with the full context.
 
 ## Step 6: Report
 
