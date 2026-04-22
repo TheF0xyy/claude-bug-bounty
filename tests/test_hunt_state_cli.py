@@ -234,6 +234,139 @@ def test_record_persists_new_context_fields(state_file):
     assert b["reason"] == "rejected"
 
 
+# --- candidate subcommand --------------------------------------------------
+
+
+def test_candidate_exits_zero(state_file):
+    result = run_cli(
+        "candidate", "--target", "example.com",
+        "--endpoint", "/account/orders/overview",
+        "--method", "GET",
+        state_file=state_file,
+    )
+    assert result.returncode == 0
+
+
+def test_candidate_creates_state_file(state_file):
+    run_cli(
+        "candidate", "--target", "example.com",
+        "--endpoint", "/account/orders/overview",
+        "--method", "GET",
+        state_file=state_file,
+    )
+    assert state_file.exists()
+
+
+def test_candidate_prints_confirmation(state_file):
+    result = run_cli(
+        "candidate", "--target", "example.com",
+        "--endpoint", "/account/orders/overview",
+        "--method", "GET",
+        state_file=state_file,
+    )
+    assert "Candidate added" in result.stdout
+    assert "/account/orders/overview" in result.stdout
+    assert "GET" in result.stdout
+
+
+def test_candidate_method_uppercased_in_output(state_file):
+    result = run_cli(
+        "candidate", "--target", "example.com",
+        "--endpoint", "/api/me",
+        "--method", "get",
+        state_file=state_file,
+    )
+    assert result.returncode == 0
+    assert "GET" in result.stdout
+
+
+def test_candidate_stored_in_json(state_file):
+    run_cli(
+        "candidate", "--target", "example.com",
+        "--endpoint", "/api/orders/123",
+        "--method", "GET",
+        state_file=state_file,
+    )
+    data = json.loads(state_file.read_text())
+    candidates = data["example.com"]["candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["endpoint"] == "/api/orders/123"
+    assert candidates[0]["method"] == "GET"
+    assert candidates[0]["status"] == "candidate"
+
+
+def test_candidate_default_method_is_get(state_file):
+    result = run_cli(
+        "candidate", "--target", "example.com",
+        "--endpoint", "/api/profile",
+        state_file=state_file,
+    )
+    assert result.returncode == 0
+    data = json.loads(state_file.read_text())
+    candidates = data["example.com"]["candidates"]
+    assert candidates[0]["method"] == "GET"
+
+
+def test_candidate_dedup_same_endpoint_and_method(state_file):
+    """Adding the same (endpoint, method) twice is a no-op — not an error."""
+    for _ in range(2):
+        r = run_cli(
+            "candidate", "--target", "example.com",
+            "--endpoint", "/api/orders/1",
+            "--method", "GET",
+            state_file=state_file,
+        )
+        assert r.returncode == 0
+
+    data = json.loads(state_file.read_text())
+    candidates = data["example.com"]["candidates"]
+    assert len(candidates) == 1, "duplicate candidate must not be stored twice"
+
+
+def test_candidate_different_methods_stored_separately(state_file):
+    for method in ("GET", "HEAD"):
+        run_cli(
+            "candidate", "--target", "example.com",
+            "--endpoint", "/api/orders/1",
+            "--method", method,
+            state_file=state_file,
+        )
+
+    data = json.loads(state_file.read_text())
+    candidates = data["example.com"]["candidates"]
+    methods = sorted(c["method"] for c in candidates)
+    assert methods == ["GET", "HEAD"]
+
+
+def test_candidate_state_file_flag_works(tmp_path):
+    custom = tmp_path / "custom_state.json"
+    result = run_cli(
+        "candidate", "--target", "example.com",
+        "--endpoint", "/api/me",
+        "--method", "GET",
+        state_file=custom,
+    )
+    assert result.returncode == 0
+    assert custom.exists()
+
+
+def test_candidate_multiple_targets_isolated(state_file):
+    for target in ("alpha.com", "beta.com"):
+        run_cli(
+            "candidate", "--target", target,
+            "--endpoint", "/api/data",
+            "--method", "GET",
+            state_file=state_file,
+        )
+
+    data = json.loads(state_file.read_text())
+    assert len(data["alpha.com"]["candidates"]) == 1
+    assert len(data["beta.com"]["candidates"]) == 1
+
+
+# --- existing dedup test ----------------------------------------------------
+
+
 def test_dedup_respects_method_and_auth_state(state_file):
     """Two records differing only in method should both be stored (not deduped)."""
     for m in ("GET", "POST"):

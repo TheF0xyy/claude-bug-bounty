@@ -781,6 +781,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"[AUTO-REPLAY ERROR] {exc}", file=sys.stderr)
         return 2
 
+    if not results:
+        print(
+            f"[auto-replay] No candidates found for {args.target} in {args.state_path}\n"
+            f"To add candidates run:\n"
+            f"  python3 tools/hunt_state.py candidate \\\n"
+            f"    --target {args.target} --endpoint /path/to/endpoint --method GET\n"
+            f"Or run /recon {args.target} first to discover endpoints."
+        )
+        return 0
+
     found_idor = False
     for r in results:
         print(r.summary())

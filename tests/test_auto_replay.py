@@ -1041,6 +1041,34 @@ class TestCLI:
         code = self._run_cli(tmp_path)
         assert code == 0
 
+    def test_no_candidates_prints_helpful_message(self, tmp_path, capsys):
+        """When no candidates exist, auto_replay must print a clear explanation."""
+        self._run_cli(tmp_path)
+        out = capsys.readouterr().out
+        assert "No candidates found" in out
+        assert "hunt_state.py candidate" in out
+
+    def test_no_candidates_message_includes_target(self, tmp_path, capsys):
+        self._run_cli(tmp_path, target="zooplus.com")
+        out = capsys.readouterr().out
+        assert "zooplus.com" in out
+
+    def test_no_candidates_message_dry_run_also_prints(self, tmp_path, capsys):
+        """Dry-run with no candidates must also print the helpful message."""
+        self._run_cli(tmp_path, extra_args=["--dry-run"])
+        out = capsys.readouterr().out
+        assert "No candidates found" in out
+
+    def test_with_candidates_does_not_print_no_candidates_message(self, tmp_path, capsys):
+        """When candidates exist, the 'No candidates' message must NOT appear."""
+        self._run_cli(
+            tmp_path,
+            candidates=[("/api/orders/1", "GET")],
+            transport=_make_transport(401, b""),
+        )
+        out = capsys.readouterr().out
+        assert "No candidates found" not in out
+
     def test_dry_run_flag_accepted(self, tmp_path):
         code = self._run_cli(
             tmp_path,
