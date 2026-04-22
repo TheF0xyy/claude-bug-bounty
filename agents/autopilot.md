@@ -197,11 +197,60 @@ Iterate the ranked TSV from Step 3b **top-to-bottom**. For each row
       `(endpoint, vuln_class, method, auth_state)` is dead, skip this
       `(endpoint, class)` pair and continue to the next class. This gate
       is independent of scoring and of the recommender.
-   b. Test with the technique appropriate to `VULN_CLASS`.
-   c. Log every request to `audit.jsonl`.
-   d. If signal found → check chain table (A→B), then break out of the
+
+   b. **Replay suggestion** — before probing, check whether a manual A/B
+      replay is worth running. Use the bridge CLI (pure function — no
+      execution, no state writes):
+
+      ```bash
+      # Initialize dedup set once before the outer endpoint loop:
+      #   declare -A REPLAY_SUGGESTED=()
+      #
+      # Inside the inner class loop, after dead-branch check passes (2a):
+      REPLAY_KEY="${ENDPOINT}::${METHOD}"
+      if [[ -z "${REPLAY_SUGGESTED[$REPLAY_KEY]+_}" ]]; then
+        REPLAY_HINT=$(python3 tools/replay_bridge.py \
+          --endpoint   "$ENDPOINT" \
+          --method     "$METHOD" \
+          --auth-state "$AUTH_STATE" \
+          --vuln-class "$VULN_CLASS" \
+          --target     "$TARGET")
+        if [[ -n "$REPLAY_HINT" ]]; then
+          echo "[HIGH SIGNAL] $ENDPOINT ($VULN_CLASS)"
+          echo "$REPLAY_HINT"
+          REPLAY_SUGGESTED[$REPLAY_KEY]=1   # dedup: suggest once per (endpoint, method)
+        fi
+      fi
+      ```
+
+      **Rules for this step:**
+      - **Do NOT execute replay.** The command is printed for the hunter
+        to run manually (or in a separate step).
+      - Output is empty when the endpoint is low-signal — no print, no
+        action needed.
+      - Dedup key is `(ENDPOINT, METHOD)`.  If multiple `VULN_CLASS`
+        values match the same endpoint, the suggestion prints **once**
+        for the first matching class and is suppressed for the rest.
+      - This step has no effect on the dead-branch gate, the scoring
+        order, or the recommender output. It is observation-only.
+
+      **Suggestion intent varies by auth context (read before acting):**
+      - `$AUTH_STATE == authenticated` → this is an **object-access
+        replay** (A/B cross-account probe). The goal is to confirm
+        whether account_b can access account_a's resource. Two live
+        sessions are required.
+      - `$AUTH_STATE == anonymous` → this is an **auth-bypass replay**.
+        The goal is to confirm whether the endpoint is reachable without
+        any credential at all. The suggestion fires only when the path
+        contains an auth-category token (`login`, `token`, `oauth`, …);
+        it is NOT an A/B object-access suggestion. Only the `no_auth`
+        leg of `tools/replay.py` carries the relevant signal here.
+
+   c. Test with the technique appropriate to `VULN_CLASS`.
+   d. Log every request to `audit.jsonl`.
+   e. If signal found → check chain table (A→B), then break out of the
       class loop for this endpoint and proceed to validation.
-   e. If 5 minutes on this `(endpoint, class)` pair with no progress →
+   f. If 5 minutes on this `(endpoint, class)` pair with no progress →
       **record dead branch with `reason=no_signal`** for that exact
       `(endpoint, vuln_class, method, auth_state)` tuple, then continue
       to the next class.
