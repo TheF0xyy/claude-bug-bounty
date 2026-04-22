@@ -20,57 +20,95 @@ at least one (ideally two) accounts.
 
 ---
 
-## Step 1 — Fetch ALL Proxy History (paginated, no regex)
+## Step 1 — Fetch Today's Proxy History (date-filtered regex)
 
-Use `get_proxy_http_history` (**not** `get_proxy_http_history_regex`) to avoid
-caching issues caused by Claude Code reusing identical regex tool-call results.
-Paginate until all history has been fetched, then filter to the target host
-in memory.
+Burp proxy history can contain tens of thousands of entries accumulated over
+many sessions.  Rather than paginating through all of them, filter to
+**today's traffic only** by matching on the current date string that appears in
+HTTP `Date:` response headers.  Today's sessions for both accounts will always
+be in this set, and the result set is small enough to process in a handful of
+pages.
 
-**Page loop:**
+---
+
+### Step 1a — Compute today's date string
+
+Derive the date in the format used by HTTP `Date:` headers:
+**`D Mon YYYY`** — day without leading zero, 3-letter month, 4-digit year.
+
+Examples: `22 Apr 2026`, `1 Jan 2026`, `15 Dec 2025`
 
 ```
+TODAY = current date formatted as "%-d %b %Y"   (Linux/macOS strftime)
+      = e.g. "22 Apr 2026"
+```
+
+In Python: `from datetime import datetime; TODAY = datetime.now().strftime("%-d %b %Y")`
+
+This string appears verbatim inside every HTTP response that Burp captured
+today, e.g.: `Date: Wed, 22 Apr 2026 19:43:10 GMT`
+
+---
+
+### Step 1b — Fetch all matching entries (paginated)
+
+```
+all_raw = []
 offset = 0
-all_entries = []
+PAGE_SIZE = 200
+HARD_CAP = 50   # max pages = 10 000 entries; more than enough for one day
 
-loop:
-  Call get_proxy_http_history with:
-    count: 100
-    offset: <current offset>
+loop (up to HARD_CAP iterations):
+    Call get_proxy_http_history_regex with:
+        regex:  TODAY          (e.g. "22 Apr 2026")
+        count:  PAGE_SIZE
+        offset: offset
 
-  If the tool is not available (Burp MCP not connected):
-    Jump to Fallback: Burp Not Connected below.
+    If the tool is not available (Burp MCP not connected):
+        Jump to Fallback: Burp Not Connected.
 
-  Append returned entries to all_entries.
+    Append returned entries to all_raw.
 
-  If fewer than 100 entries were returned this page:
-    Stop — this is the last page.
-  Else:
-    offset += 100
-    Continue loop.
+    If fewer than PAGE_SIZE entries were returned:
+        break   # last page
+    Else:
+        offset += PAGE_SIZE
+        Continue loop.
 ```
 
-**Client-side host filter (applied after all pages collected):**
+Print: `[Step 1] Fetched {len(all_raw)} entries matching {TODAY} from Burp.`
 
-Keep only entries where the `host` field (or the `Host:` header in the raw
-`request` text) matches the target domain.  A case-insensitive substring match
-is sufficient:
+---
+
+### Step 1c — Client-side host filter
+
+Keep only entries where the host matches the target (case-insensitive
+substring match on the `host` field or the `Host:` header in the raw request):
 
 ```
-target_entries = [e for e in all_entries if TARGET in (e.host or "").lower()
-                                         or TARGET in raw_host_header(e).lower()]
+target_entries = [e for e in all_raw
+                  if TARGET in (e.host or "").lower()
+                  or TARGET in raw_host_header(e).lower()]
 ```
 
-**After filtering:**
+---
 
-- `total = len(target_entries)`
-- If `total < 5`: tell the user:
+### Step 1d — Fallback: try yesterday if today is sparse
 
-> Not enough Burp history for {target} — only {total} entries found.
-> Browse {target} while logged in through the Burp proxy, then
+If `len(target_entries) < 5`, the session may have started before midnight.
+Re-run Step 1b using yesterday's date string (`YESTERDAY`), merge results with
+`all_raw`, reapply the host filter.
+
+If still `< 5` after yesterday's fallback, tell the user:
+
+> Not enough Burp history for {target} matching {TODAY} — only {total}
+> entries found.
+> Browse {target} while logged in through the Burp proxy today, then
 > re-run `/burp-bootstrap {target}`.
 
 Stop here.
+
+---
 
 All subsequent steps (Step 2 onward) operate on `target_entries`.
 
@@ -417,7 +455,7 @@ Next steps:
 
 ## Fallback: Burp Not Connected
 
-If `get_proxy_http_history` returns an error or is not available, ask:
+If `get_proxy_http_history_regex` returns an error or is not available, ask:
 
 > Burp MCP is not connected. How would you like to proceed?
 >
@@ -480,30 +518,51 @@ manually for each one.
 
 ---
 
-## Why `get_proxy_http_history` (not regex)
+## Why this fetch strategy
 
-The regex variant (`get_proxy_http_history_regex`) is prone to being returned
-as a cached tool-call result by Claude Code when the same regex is repeated
-across a session, meaning new Burp traffic captured since the first call would
-be silently omitted.
+**Date regex — slices today's traffic without paging through all history:**
+A Burp history with 18 000+ entries accumulated over weeks cannot be fully
+paginated in a reasonable number of tool calls.  Both accounts browsed
+*today*, so filtering on today's date string (which appears in every HTTP
+`Date:` response header) returns only relevant entries — typically a few
+hundred — regardless of total history size.
 
-By using the non-regex variant with explicit pagination and client-side host
-filtering, each call passes a different `offset` parameter, preventing cache
-hits and guaranteeing fresh data on every page.
+**Different offset each page — avoids Claude Code tool-call caching:**
+Claude Code caches tool results for identical parameter sets.  Calling
+`get_proxy_http_history_regex` with the same `regex` and `offset=0` twice in
+the same session would return the cached result from the first call.  By
+incrementing `offset` by 200 each page, every call has unique parameters and
+is never served from cache.  The date regex itself also changes daily, so
+repeated runs on different days automatically bypass any cross-session cache.
+
+**Yesterday fallback — handles midnight-boundary sessions:**
+If a testing session started before midnight and continued into today, some
+entries may carry yesterday's date.  The yesterday fallback catches this edge
+case without requiring the user to know which date to use.
+
+**Hard cap of 50 pages — prevents runaway loops:**
+One day's Burp traffic for a single target rarely exceeds a few thousand
+entries.  The 50-page cap (10 000 entries) is a safety net that cannot be
+reached in normal use but prevents an infinite loop if the date regex
+unexpectedly matches many unrelated entries.
 
 ---
 
 ## Manual Test
 
 1. Open Burp Suite Professional with the MCP extension enabled (port 9876)
-2. Log in to `target.com` as **account_a** — browse several API paths
-3. Log in to `target.com` as **account_b** — browse several API paths  
-   (The second login sets a new `MZPSID` cookie via Set-Cookie, which is the
-   primary signal used to distinguish the two accounts)
+2. Log in to `target.com` as **account_a** **today** — browse several API paths
+3. Log in to `target.com` as **account_b** **today** — browse several API paths
+   (Both sessions must have occurred today so they appear in the date-filtered
+   result set.  The second login sets a new `MZPSID` cookie via Set-Cookie,
+   which is the primary signal used to distinguish the two accounts.)
 4. Run: `/burp-bootstrap target.com`
-5. Verify `memory/sessions.json` contains `account_a`, `account_b`, and
+5. Confirm Step 1 output shows:
+   - `Fetched N entries matching DD Mon YYYY from Burp` with N > 10
+   - Both accounts detected in Step 3
+6. Verify `memory/sessions.json` contains `account_a`, `account_b`, and
    `no_auth` entries with non-empty `cookies` (MZPSID) or `auth_header`
-6. Verify `memory/hunt_state.json` has `candidates` entries for the target
-7. Run: `python3.13 tools/auto_replay.py --target target.com --dry-run`
-8. Confirm the dry-run output lists the expected candidate endpoints
-9. Run: `python3.13 tools/auth_check.py` to verify sessions are valid
+7. Verify `memory/hunt_state.json` has `candidates` entries for the target
+8. Run: `python3.13 tools/auto_replay.py --target target.com --dry-run`
+9. Confirm the dry-run output lists the expected candidate endpoints
+10. Run: `python3.13 tools/auth_check.py` to verify sessions are valid
