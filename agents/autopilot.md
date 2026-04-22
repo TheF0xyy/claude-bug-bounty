@@ -105,16 +105,56 @@ scope.filter_file("recon/target/urls.txt")
 
 ## Step 3: Rank
 
+### 3a. Tier ranking (recon-ranker)
+
 Invoke the `recon-ranker` agent on cached recon. It produces:
 - P1 targets (start here)
 - P2 targets (after P1 exhausted)
 - Kill list (skip these)
 
+### 3b. Score-based ordering
+
+After the ranker returns, sort endpoints **within each tier** by
+hunt-priority score. Score is a deterministic integer computed by
+`tools/scoring.py` over `(endpoint, method, auth_state)` and covers: API /
+identity / business-logic / auth / multi-tenant path tokens, identifier
+shapes (numeric / UUID / MongoDB ObjectId / `{id}` placeholders / `?id=`
+queries), HTTP method weight, auth context, and negative penalties for
+static assets and well-known filenames.
+
+Higher score = hunted earlier. **Scoring only RANKS — it never skips.**
+Dead-branch skipping stays in Step 4 as the per-request gate.
+
+Build a TSV of candidate `method<TAB>endpoint` rows and pipe it through the
+CLI wrapper:
+
+```bash
+# P1_CANDIDATES is a bash array of "METHOD<TAB>ENDPOINT" rows from Step 3a.
+printf '%s\n' "${P1_CANDIDATES[@]}" | \
+  python3 tools/rank_endpoints.py --auth-state "$AUTH_STATE" \
+  > /tmp/autopilot_p1_ranked.tsv
+```
+
+Output is `<SCORE><TAB><METHOD><TAB><ENDPOINT>` sorted descending. Stable
+sort — ties preserve the ranker's original order.
+
+Optional `--min-score N` drops rows whose score is below N from the visible
+queue. MVP default: **no threshold** (scoring never deletes candidates on
+its own). Use `--min-score 1` only if you want the obvious noise
+(robots.txt, static assets) hidden from the hunt window.
+
+Re-score when `$AUTH_STATE` transitions (anonymous → authenticated after
+login): the score for identity-touching endpoints rises by +1, which
+surfaces them earlier in the post-login queue.
+
 ## Step 4: Hunt
 
-For each P1 target endpoint:
+Iterate the ranked TSV from Step 3b **top-to-bottom**. For each row
+`(SCORE, METHOD, ENDPOINT)`:
 
-1. **Dead-branch check** (see `## Dead-Branch Memory` below). If `(endpoint, vuln_class)` is dead, skip to next endpoint and do not issue any request.
+1. **Dead-branch check** (see `## Dead-Branch Memory` below). If
+   `(endpoint, vuln_class, method, auth_state)` is dead, skip to the next
+   row and do not issue any request. This gate is independent of scoring.
 2. Select vuln class based on tech stack + URL pattern + memory
 3. Test with appropriate technique
 4. Log every request to audit.jsonl
